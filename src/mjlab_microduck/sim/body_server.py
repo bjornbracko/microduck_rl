@@ -68,6 +68,9 @@ TIMESTEP = 0.005
 # Where `scripts/infer_policy.py` puts a duck before it starts: trunk this high, upright, every joint
 # at the home pose. Not a keyframe — the keyframes are poses and this is a *placement*.
 HOME_TRUNK_Z = 0.125
+# The roller deployment rehearsal uses the same home pose, 13.5 mm higher for the wheels.
+ROLLER_HEIGHT = 0.0135
+WHEEL_FRICTION = 0.003
 
 # `duck_ipc_proto::JOINT_NAMES`, which is protocol: every positional array on the wire is indexed by
 # it. Duplicated here rather than shared, because the two repositories cannot share a constant — and
@@ -130,6 +133,16 @@ def build_world(scene: Path, count: int) -> mujoco.MjModel:
     return spec.compile()
 
 
+def wheel_dofs(model: mujoco.MjModel) -> list[int]:
+    """Passive wheel bearings, excluding the passive backlash joints in other models."""
+    return [
+        int(model.jnt_dofadr[joint])
+        for joint in range(model.njnt)
+        if (name := mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_JOINT, joint))
+        and name.startswith("passive_") and name.endswith("_wheel")
+    ]
+
+
 def pose_table(scene: Path, keyframe: str) -> tuple[dict[str, float] | None, float]:
     """A named pose from the scene's keyframes, as joint name → angle.
 
@@ -137,9 +150,9 @@ def pose_table(scene: Path, keyframe: str) -> tuple[dict[str, float] | None, flo
     scene's keyframes with it — and a pose is a fact about the robot, not about how many of them are
     in the room.
     """
-    if keyframe.upper() == "HOME":
-        return None, HOME_TRUNK_Z
     model = mujoco.MjModel.from_xml_path(str(scene))
+    if keyframe.upper() == "HOME":
+        return None, HOME_TRUNK_Z + (ROLLER_HEIGHT if wheel_dofs(model) else 0.0)
     names = [mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_KEY, i) for i in range(model.nkey)]
     if keyframe not in names:
         raise SystemExit(
@@ -178,7 +191,22 @@ class World:
     def __init__(self, scene: Path, count: int = 1):
         self.model = build_world(scene, count)
         self.model.opt.timestep = TIMESTEP
-        self.data = mujoco.MjData(self.model)
+        self.bam = None
+        if wheel_dofs(self.model):
+            if count != 1:
+                raise ValueError("roller simulation currently supports one duck")
+            from mjlab_microduck.sim.actuators import (
+                BAM_KP_FW, BAM_MAX_CURRENT, BAM_VIN_MIN, load_bam_model, load_mujoco_with_bam,
+            )
+            self.model, self.data, self.bam, _ = load_mujoco_with_bam(
+                str(scene), load_bam_model(BAM_KP_FW, NOMINAL_VOLTS, BAM_MAX_CURRENT),
+                TIMESTEP, 0.1, BAM_VIN_MIN,
+            )
+        else:
+            self.data = mujoco.MjData(self.model)
+        # Match infer_policy.py's roller deployment: frictionless XML bearings are for
+        # training, while CPU inference needs the measured wheel bearing friction.
+        self.model.dof_frictionloss[wheel_dofs(self.model)] = WHEEL_FRICTION
         self.lock = threading.Lock()
         self.bodies: list[Body] = []
 
@@ -193,6 +221,8 @@ class World:
         """
         with self.lock:
             for _ in range(times):
+                if self.bam is not None:
+                    self.bam.update()
                 mujoco.mj_step(self.model, self.data)
                 # A duck nobody has enabled yet is put back where it was. Physics is shared, so
                 # it cannot simply not be stepped — and a hand steadying one robot while another
@@ -244,6 +274,11 @@ class Body:
         self.trunk_dof = int(model.jnt_dofadr[ident(mujoco.mjtObj.mjOBJ_JOINT, "trunk_base_freejoint")])
 
         self.actuator_slice = np.array(self.actuators)
+        self.bam_targets = None
+        if world.bam is not None:
+            self.bam_targets = np.array([
+                world.bam.dof_to_q_target[JOINT_NAMES[i]] for i in self.to_wire
+            ])
         self._gain = model.actuator_gainprm[self.actuator_slice, 0].copy()
 
         # **Held until the daemon takes it.** A biped at a static pose is not stable: holding the
@@ -252,6 +287,7 @@ class Body:
         # policy balancing from step zero. `robotd` deliberately does not enable torque when it
         # starts, so the seconds before it would be spent falling over.
         self.released = limp
+        self._steady_until_command = bool(wheel_dofs(model)) and not limp
         self.torque_on = not limp
         self.kp = kp
         self.held = None
@@ -271,6 +307,8 @@ class Body:
             data.qpos[self.qpos_adr[slot]] = value
             data.qvel[self.qvel_adr[slot]] = 0.0
         data.ctrl[self.actuator_slice] = data.qpos[self.qpos_adr]
+        if self.world.bam is not None:
+            self.world.bam.reset(data.qpos)
         self._apply_torque()
         self.remember()
 
@@ -357,8 +395,17 @@ class Body:
         if len(wire_targets) != len(JOINT_NAMES):
             raise ValueError(f"expected {len(JOINT_NAMES)} targets, got {len(wire_targets)}")
         with self.world.lock:
-            for slot, wire_index in enumerate(self.to_wire):
-                self.world.data.ctrl[self.actuators[slot]] = wire_targets[wire_index]
+            targets = np.array([wire_targets[i] for i in self.to_wire])
+            if self.world.bam is not None:
+                self.world.bam.q_target[self.bam_targets] = targets
+            else:
+                self.world.data.ctrl[self.actuator_slice] = targets
+            # On skates the daemon's initial home ramp cannot balance. Keep the startup
+            # hand steady until the policy sends its first target away from that pose.
+            if self._steady_until_command and self.torque_on and self.held is not None:
+                if np.max(np.abs(targets - self.held[1])) > 1e-4:
+                    self.released = True
+                    self._steady_until_command = False
 
     def set_gain(self, kp: int) -> None:
         with self.world.lock:
@@ -369,9 +416,12 @@ class Body:
         with self.world.lock:
             self.torque_on = bool(on)
             if on:
-                self.released = True
+                if not self._steady_until_command:
+                    self.released = True
                 # Torque arriving must not fling the robot at a stale target.
                 self.world.data.ctrl[self.actuator_slice] = self.world.data.qpos[self.qpos_adr]
+                if self.world.bam is not None:
+                    self.world.bam.reset(self.world.data.qpos)
             self._apply_torque()
 
     def _apply_torque(self) -> None:
@@ -384,6 +434,10 @@ class Body:
         """
         scale = (self.kp / 200.0) if self.torque_on else 0.0
         model = self.world.model
+        if self.world.bam is not None:
+            self.world.bam.model.actuator.kp = self.kp
+            model.actuator_gainprm[self.actuator_slice, 0] = float(self.torque_on)
+            return
         model.actuator_gainprm[self.actuator_slice, 0] = self._gain * scale
         model.actuator_biasprm[self.actuator_slice, 1] = -self._gain * scale
 
