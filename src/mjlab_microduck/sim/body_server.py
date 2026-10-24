@@ -210,6 +210,27 @@ class World:
         self.lock = threading.Lock()
         self.bodies: list[Body] = []
 
+    def reset_home(self) -> None:
+        """Reset a single twin after robotd has acknowledged torque-off.
+
+        All passive wheel state and warm-start forces must be reset too. Keep simulation
+        time monotonic for sensor/camera consumers, and steady the home ramp in either mode.
+        """
+        with self.lock:
+            if len(self.bodies) != 1:
+                raise RuntimeError("native reset supports one duck")
+            body = self.bodies[0]
+            if body.torque_on:
+                raise RuntimeError("controller must relax before resetting the body")
+            sim_time = self.data.time
+            mujoco.mj_resetData(self.model, self.data)
+            self.data.time = sim_time
+            body.released = False
+            body._steady_until_command = True
+            height = HOME_TRUNK_Z + (ROLLER_HEIGHT if wheel_dofs(self.model) else 0.0)
+            body.place(None, height, 0.0)
+            mujoco.mj_forward(self.model, self.data)
+
     def step(self, times: int = 1) -> None:
         """Advance the world, taking the lock once for the whole batch.
 
@@ -490,7 +511,7 @@ class Server(socketserver.ThreadingTCPServer):
     daemon_threads = True
 
 
-def run(world: World, headless: bool) -> None:
+def run(world: World, headless: bool, control_socket: Path | None = None) -> None:
     """Step in real time.
 
     **Real time, not as fast as possible.** The daemon's loop is wall-clock and its health gate
@@ -498,16 +519,23 @@ def run(world: World, headless: bool) -> None:
     makes every duck report unhealthy and the updater start rolling releases back.
     """
     viewer = None
+    controls = None
     if not headless:
         try:
-            import mujoco.viewer
-
-            # No side panels: this window is for watching ducks, and everything the panels would
-            # drive belongs to the daemons.
-            viewer = mujoco.viewer.launch_passive(
-                world.model, world.data, show_left_ui=False, show_right_ui=False
-            )
+            if control_socket is not None:
+                from mjlab_microduck.sim.native_viewer import NativeViewer
+                from mjlab_microduck.sim.viewer_controls import NativeControls
+                controls = NativeControls(control_socket, world)
+                viewer = NativeViewer(world, controls)
+                controls.start()
+            else:
+                import mujoco.viewer
+                viewer = mujoco.viewer.launch_passive(
+                    world.model, world.data, show_left_ui=False, show_right_ui=False
+                )
         except Exception as error:
+            if control_socket is not None:
+                raise RuntimeError(f"native controls could not start: {error}") from error
             print(f"== no viewer ({error}); running headless", flush=True)
 
     dt = world.model.opt.timestep
@@ -525,9 +553,36 @@ def run(world: World, headless: bool) -> None:
     step = 0
     next_step = time.perf_counter()
     behind = 0
+    physics_stop = threading.Event()
+    physics_errors = []
+    physics_thread = None
+    if controls is not None:
+        # Native OpenGL must render on Cocoa's main thread. A slow frame must not slow
+        # the robot's body: robotd still observes and acts at 50 Hz of wall-clock time.
+        def physics():
+            deadline = time.perf_counter()
+            try:
+                while not physics_stop.is_set():
+                    world.step(batch)
+                    deadline += period
+                    slack = deadline - time.perf_counter()
+                    if slack > 0:
+                        physics_stop.wait(slack)
+                    elif slack < -0.25:
+                        deadline = time.perf_counter()
+            except Exception as error:
+                physics_errors.append(error)
+                physics_stop.set()
+        physics_thread = threading.Thread(target=physics, daemon=True)
+        physics_thread.start()
     try:
         while True:
-            world.step(batch)
+            if controls is not None:
+                viewer.poll()
+                if physics_stop.is_set():
+                    break
+            else:
+                world.step(batch)
             if viewer is not None and not viewer.is_running():
                 break
             next_step += period
@@ -538,10 +593,11 @@ def run(world: World, headless: bool) -> None:
                 time.sleep(slack)
             elif slack < -0.25:
                 behind += 1
-                print(
-                    f"== behind real time by {-slack:.2f}s (x{behind}) — fewer ducks, or --headless",
-                    flush=True,
-                )
+                if controls is None:
+                    print(
+                        f"== behind real time by {-slack:.2f}s (x{behind}) — fewer ducks, or --headless",
+                        flush=True,
+                    )
                 next_step = time.perf_counter()
             step += 1
             if viewer is not None and step % passes_per_frame == 0:
@@ -553,8 +609,15 @@ def run(world: World, headless: bool) -> None:
     except KeyboardInterrupt:
         pass
     finally:
+        physics_stop.set()
+        if physics_thread is not None:
+            physics_thread.join(timeout=1.0)
+        if controls is not None:
+            controls.close()
         if viewer is not None:
             viewer.close()
+    if physics_errors:
+        raise RuntimeError("native simulator physics stopped") from physics_errors[0]
 
 
 def main() -> None:
@@ -564,6 +627,8 @@ def main() -> None:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=7801, help="the first duck's port; +1 each")
     parser.add_argument("--headless", action="store_true", help="no viewer window")
+    parser.add_argument("--control-socket", type=Path,
+                        help="robotd socket for native arrow/Space/R controls (one duck)")
     parser.add_argument(
         "--cameras",
         default="",
@@ -595,6 +660,8 @@ def main() -> None:
         )
     if args.ducks < 1:
         raise SystemExit("--ducks needs at least one duck")
+    if args.control_socket and args.ducks != 1:
+        raise SystemExit("--control-socket supports one duck")
 
     world = World(args.scene, args.ducks)
     pose, trunk_z = pose_table(args.scene, args.keyframe)
@@ -631,7 +698,7 @@ def main() -> None:
         eye = f" · camera on {args.host}:{args.frame_port + index}" if index in wanted else ""
         print(f"==   duck {index}: robotd --sim {args.host}:{args.port + index}{eye}", flush=True)
 
-    run(world, headless=args.headless)
+    run(world, headless=args.headless, control_socket=args.control_socket)
 
 
 if __name__ == "__main__":
